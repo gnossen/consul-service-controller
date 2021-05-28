@@ -1,11 +1,9 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
     "k8s.io/apimachinery/pkg/fields"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -27,6 +25,20 @@ var consulEndpoint = flag.String("consul-endpoint", "sidecar:8500", "The endpoin
 var httpClient = &http.Client{}
 
 // TODO: Implement an in-memory datastore and diff against the state of the world to enable deregistration on poll.
+
+// Must check address count before calling this function.
+func getServiceAddress(service corev1.Service) string {
+    return service.Status.LoadBalancer.Ingress[0].IP
+}
+
+func getAddressCount(service corev1.Service) int {
+    return len(service.Status.LoadBalancer.Ingress)
+}
+
+func isServiceApplicable(service corev1.Service) bool {
+    // Consul can only support a single address.
+    return getAddressCount(service) == 1
+}
 
 func tryRegisterHostname(hostname string, ip string) error {
 	log.Printf("Attempting to register %s at %s.\n", hostname, ip)
@@ -68,11 +80,10 @@ func registerHostname(hostname string, ip string) {
 func registerService(service corev1.Service) {
     hostname := service.Name
     namespace := service.Namespace
-    for _, ingress := range service.Status.LoadBalancer.Ingress {
-        registerHostname(fmt.Sprintf("%s-%s", hostname, namespace), ingress.IP)
-        if namespace == "default" {
-            registerHostname(hostname, ingress.IP)
-        }
+    ip := getServiceAddress(service)
+    registerHostname(fmt.Sprintf("%s-%s", hostname, namespace), ip)
+    if namespace == "default" {
+        registerHostname(hostname, ip)
     }
 }
 
@@ -115,25 +126,6 @@ func deregisterService(service corev1.Service) {
     }
 }
 
-func updatePeriodically(clientset *kubernetes.Clientset) {
-	for {
-		services, err := clientset.CoreV1().Services("").List(context.Background(), metav1.ListOptions{})
-		if err != nil {
-			panic(err.Error())
-		}
-
-		for _, service := range services.Items {
-            registerService(service)
-		}
-
-		time.Sleep(time.Second * time.Duration(*pollSeconds))
-	}
-}
-
-func isServiceApplicable(service corev1.Service) bool {
-    return len(service.Status.LoadBalancer.Ingress) > 0
-}
-
 func updateOnDeltas(clientset *kubernetes.Clientset) {
     watchlist := cache.NewListWatchFromClient(
         clientset.CoreV1().RESTClient(),
@@ -143,7 +135,8 @@ func updateOnDeltas(clientset *kubernetes.Clientset) {
 
     // Presence in this janky hash set signifies that we have registered the
     // corresponding service in Consul and have not deregistered it.
-    activeServices := map[string]bool{}
+    // Keys are of the form <NAMESPACE>/<SERVICE_NAME> and the value is the service address.
+    activeServices := map[string]string{}
     getKey := func(service corev1.Service) string {
         return fmt.Sprintf("%s/%s", service.Namespace, service.Name)
     }
@@ -159,7 +152,7 @@ func updateOnDeltas(clientset *kubernetes.Clientset) {
                 log.Printf("Received add for %s\n", service.Name)
                 if isServiceApplicable(service) {
                     registerService(service)
-                    activeServices[getKey(service)] = true
+                    activeServices[getKey(service)] = getServiceAddress(service)
                 }
             },
             DeleteFunc: func(obj interface{}) {
@@ -178,11 +171,17 @@ func updateOnDeltas(clientset *kubernetes.Clientset) {
                 _, existing := activeServices[getKey(oldService)]
                 applicable := isServiceApplicable(newService)
                 if existing {
-                    deregisterService(oldService)
-                    registerService(newService)
+                    oldAddress := activeServices[getKey(oldService)]
+                    newAddress := getServiceAddress(newService)
+                    if oldAddress != newAddress {
+                        // This just acts as an override.
+                        registerService(newService)
+                        activeServices[getKey(newService)] = newAddress
+                    }
                 } else if applicable {
+                    // Newly applicable. Treat like an add operation.
                     registerService(newService)
-                    activeServices[getKey(newService)] = true
+                    activeServices[getKey(newService)] = getServiceAddress(newService)
                 }
             },
         },
@@ -211,8 +210,5 @@ func main() {
 		panic(err.Error())
 	}
 
-    // go updateOnDeltas(clientset)
     updateOnDeltas(clientset)
-
-	// updatePeriodically(clientset)
 }
