@@ -1,0 +1,37 @@
+We need updates to hostnames to happen very quickly after a resource changes in
+kubernetes. This means we'll need a watch operationg ongoing. But we also want
+to account for catching up, i.e when the controller startys and several services
+already exist. We also want to account for any missed updates due to downtime.
+Finally, we need to ensure that updates are sent before the entries time out in
+consul.
+
+I think we can solve all of these use cases with two goroutines running
+concurrently: one updating deltas according to a watch and the other doing a
+state-of-the-world update on a timer.
+
+So I was thinking about only registering services matching an annotation and
+also restricting to a set of namespaces. But I don't think that's necessary.
+Metallab will operate on anything that is of type LoadBalancer. Why shouldn't I
+do somethign similar?
+
+The only potential problem I see is that operating on multiple namespaces and
+using just the service name for the DNS entry means that we might have name
+clashes. Since we're just doing a stateless fire-and-forget model, that would
+mean that the actual DNS entry that won out for competing names would be
+nondeterministic. We *could* ignore that problem.
+
+I think the "proper" solution would be namespacing. So service "foo" in
+namespace "bar" would be resolveable as "foo.bar" or perhaps "bar.foo". But that
+doesn't appeal to me aesthetically. We *could* in addition add just "foo" in
+case "foo" is in the deault namespace. This would allow us to avoid name clashes
+entirely. I like that one. Let's go with that.
+
+After looking at the built-in controller infrastructure in this repo, I may
+actually be able to get rid of my state-of-the-world code. That sort of thing
+appears to already be built in. Yay!
+
+Bit of a snag. I've found that the periodic polling I get is an *update*. I
+suppose that makes sense. But my update operation was a delete followed by an
+add. That's way too much churn. I'm going to have to do this more intelligently,
+I think. I'll actually have to store my opinion of the currently stored
+endpoints.
