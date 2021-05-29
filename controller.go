@@ -21,10 +21,10 @@ import (
 
 var pollSeconds = flag.Int("poll-seconds", 60, "The number of seconds between state-of-the-world updates.")
 var consulEndpoint = flag.String("consul-endpoint", "sidecar:8500", "The endpoint of the consul service to register with.")
+var consulMaxAttempts = flag.Int("max-consul-attempts", 5, "The maximum number of times to attempt to register/deregister services with Consul.")
+var consulWaitSeconds = flag.Int("attempt-wait-seconds", 2, "The number of seconds to wait between attempts.")
 
 var httpClient = &http.Client{}
-
-// TODO: Implement an in-memory datastore and diff against the state of the world to enable deregistration on poll.
 
 // Must check address count before calling this function.
 func getServiceAddress(service corev1.Service) string {
@@ -41,7 +41,7 @@ func isServiceApplicable(service corev1.Service) bool {
 }
 
 func tryRegisterHostname(hostname string, ip string) error {
-	log.Printf("Attempting to register %s at %s.\n", hostname, ip)
+	log.Printf("Registering %s at %s.\n", hostname, ip)
 	endpoint := fmt.Sprintf("http://%s/v1/agent/service/register", *consulEndpoint)
 	body, err := json.Marshal(map[string]string{
 		"Name":    hostname,
@@ -66,15 +66,36 @@ func tryRegisterHostname(hostname string, ip string) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("Registration was unsuccessful with code %d: %s\n", resp.StatusCode, bodyBytes)
 	}
-	log.Printf("Successfully registered.")
 	return nil
 }
 
+func retry(maxAttempts int, waitPeriod time.Duration, msg string, fn func() error) {
+    for i := 0; i < maxAttempts; i++ {
+        err := fn()
+        if err == nil {
+            // Don't clutter the logs if we succeed on the first try.
+            if i != 0 {
+                log.Printf("Success: %s\n", msg)
+            }
+            break
+        }
+        log.Printf("Failure: %s\nError: %s\n", msg, err)
+        if i == maxAttempts -1 {
+            log.Printf("Maximum of %d attempts reached. Giving up.\n", maxAttempts)
+            break
+        }
+        log.Printf("Trying againt after %s.\n", waitPeriod)
+        time.Sleep(waitPeriod)
+    }
+}
+
 func registerHostname(hostname string, ip string) {
-	// TODO: Implement some sort of retry.
-	if err := tryRegisterHostname(hostname, ip); err != nil {
-		log.Printf("Error registering %s at %s: %v.\n", hostname, ip, err)
-	}
+    retry(*consulMaxAttempts,
+        time.Duration(*consulWaitSeconds) * time.Second,
+        fmt.Sprintf("Register %s at %s", hostname, ip),
+        func() error {
+            return tryRegisterHostname(hostname, ip)
+        })
 }
 
 func registerService(service corev1.Service) {
@@ -88,7 +109,7 @@ func registerService(service corev1.Service) {
 }
 
 func tryDeregisterHostname(hostname string) error {
-	log.Printf("Attempting to deregister %s.\n", hostname)
+	log.Printf("Deregistering %s.\n", hostname)
 	endpoint := fmt.Sprintf("http://%s/v1/agent/service/deregister/%s", *consulEndpoint, hostname)
 	req, err := http.NewRequest("PUT", endpoint, nil)
 	if err != nil {
@@ -106,15 +127,16 @@ func tryDeregisterHostname(hostname string) error {
 	if resp.StatusCode != 200 {
 		return fmt.Errorf("Deregistration was unsuccessful with code %d: %s\n", resp.StatusCode, bodyBytes)
 	}
-	log.Printf("Successfully deregistered.")
 	return nil
 }
 
 func deregisterHostname(hostname string) {
-	// TODO: Implement some sort of retry.
-	if err := tryDeregisterHostname(hostname); err != nil {
-		log.Printf("Error deregistering %s: %v.\n", hostname, err)
-	}
+    retry(*consulMaxAttempts,
+        time.Duration(*consulWaitSeconds) * time.Second,
+        fmt.Sprintf("Deregister %s", hostname),
+        func() error {
+            return tryDeregisterHostname(hostname)
+        })
 }
 
 func deregisterService(service corev1.Service) {
@@ -144,12 +166,10 @@ func updateOnDeltas(clientset *kubernetes.Clientset) {
     _, controller := cache.NewInformer(
         watchlist,
         &corev1.Service{},
-        // TODO: This may allow us to get rid of the other goroutine. Figure out if that's true.
         time.Second * time.Duration(*pollSeconds),
         cache.ResourceEventHandlerFuncs{
             AddFunc: func(obj interface{}) {
                 service := *obj.(*corev1.Service)
-                log.Printf("Received add for %s\n", service.Name)
                 if isServiceApplicable(service) {
                     registerService(service)
                     activeServices[getKey(service)] = getServiceAddress(service)
@@ -157,7 +177,6 @@ func updateOnDeltas(clientset *kubernetes.Clientset) {
             },
             DeleteFunc: func(obj interface{}) {
                 service := *obj.(*corev1.Service)
-                log.Printf("Received delete for %s\n", service.Name)
                 key := getKey(service)
                 if _, ok := activeServices[key]; ok {
                     deregisterService(service)
@@ -167,7 +186,6 @@ func updateOnDeltas(clientset *kubernetes.Clientset) {
             UpdateFunc: func(oldObj, newObj interface{}) {
                 oldService := *oldObj.(*corev1.Service)
                 newService := *newObj.(*corev1.Service)
-                log.Printf("Received update for %s\n", oldService.Name)
                 _, existing := activeServices[getKey(oldService)]
                 applicable := isServiceApplicable(newService)
                 if existing {
@@ -202,8 +220,6 @@ func main() {
 	if err != nil {
 		panic(err.Error())
 	}
-
-	// TODO: Implement delta update in a goroutine.
 
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {

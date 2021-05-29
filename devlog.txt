@@ -35,3 +35,7 @@ suppose that makes sense. But my update operation was a delete followed by an
 add. That's way too much churn. I'm going to have to do this more intelligently,
 I think. I'll actually have to store my opinion of the currently stored
 endpoints.
+
+Alright. Now we're just on the controller. And everything seems to be working
+super smoothly. I can create a service and it's *instantly* available via DNS.
+Very nice.
