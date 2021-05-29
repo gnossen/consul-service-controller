@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
     "k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -23,6 +24,7 @@ var pollSeconds = flag.Int("poll-seconds", 60, "The number of seconds between st
 var consulEndpoint = flag.String("consul-endpoint", "sidecar:8500", "The endpoint of the consul service to register with.")
 var consulMaxAttempts = flag.Int("max-consul-attempts", 5, "The maximum number of times to attempt to register/deregister services with Consul.")
 var consulWaitSeconds = flag.Int("attempt-wait-seconds", 2, "The number of seconds to wait between attempts.")
+var local = flag.Bool("local", false, "Indicates that the server is not running in a cluster.")
 
 var httpClient = &http.Client{}
 
@@ -208,7 +210,6 @@ func updateOnDeltas(clientset *kubernetes.Clientset) {
 }
 
 func main() {
-	// TODO; Support in-cluster auth.
 	var kubeconfig *string
 	if home := homedir.HomeDir(); home != "" {
 		kubeconfig = flag.String("kubeconfig", filepath.Join(home, ".kube", "config"), "(optional) absolute path to the kubeconfig file")
@@ -216,7 +217,14 @@ func main() {
 		kubeconfig = flag.String("kubeconfig", "", "absolute path to the kubeconfig file")
 	}
 	flag.Parse()
-	config, err := clientcmd.BuildConfigFromFlags("", *kubeconfig)
+
+    var config *rest.Config
+    var err error
+    if (*local) {
+	    config, err = clientcmd.BuildConfigFromFlags("", *kubeconfig)
+    } else {
+        config, err = rest.InClusterConfig()
+    }
 	if err != nil {
 		panic(err.Error())
 	}
